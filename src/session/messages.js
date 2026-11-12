@@ -1,0 +1,194 @@
+// Control messages between players (everything except game packets), and the host's bookkeeping of its guests.
+import { MAX_GUESTS } from "../../relay/src/protocol.js";
+import { currentGuns, currentHorde, currentZone, MAP_SLUGS } from "../game/page.js";
+import { send } from "../net/pump.js";
+import { RTC_TYPES } from "../net/rtc-messages.js";
+import { followHostMap } from "./guest.js";
+import { onMapMessage } from "../map/net.js";
+import { validSeat, VERSION } from "./session.js";
+
+export function onControl(session, message) {
+  if (RTC_TYPES.includes(message.t)) session.direct?.onSignal(message);
+  else if (session.mode === "host") onHostMessage(session, message);
+  else onGuestMessage(session, message);
+}
+
+function onHostMessage(session, message) {
+  switch (message.t) {
+    case "welcome":
+      session.overQuota = null;
+      session.relayGuests = new Set((Array.isArray(message.guests) ? message.guests : []).filter(validSeat));
+      session.relayLeft = new Set();
+      for (let seat = 1; seat <= MAX_GUESTS; seat += 1) syncPresence(session, seat);
+      break;
+    case "peer":
+      if (!validSeat(message.seat)) return;
+      // Whoever the relay seats after a guest left (seen by this host connection) may be someone else: the direct link
+      // made with the one who left is dropped, and the seat's player sets up a fresh one. A relay restart that drops
+      // everyone, the host included, starts over at "welcome" and keeps the links; a new offer replaces a link anyway.
+      if (message.present && session.relayLeft.delete(message.seat)) session.direct?.drop(message.seat);
+      if (message.present) {
+        session.relayGuests.add(message.seat);
+        // A guest page that (re)connects needs the map and settings, even if the seat never looked empty (the invite
+        // page handing over to the map page replaces its socket without a "left" in between).
+        guestArrived(session, message.seat);
+      } else {
+        session.relayGuests.delete(message.seat);
+        session.relayLeft.add(message.seat);
+      }
+      syncPresence(session, message.seat);
+      break;
+    case "state":
+      if (validSeat(message.from)) guest(session, message.from).state = message;
+      break;
+    case "pause":
+      if (validSeat(message.from)) guest(session, message.from).pause = Boolean(message.on);
+      break;
+    case "error":
+      session.note(`relay error ${message.code}`);
+      if (message.code === "over_quota") session.overQuota = { resetsAt: message.resetsAt ?? null };
+      break;
+  }
+  session.peer = [...session.guests.values()].some((g) => g.present);
+}
+
+function onGuestMessage(session, message) {
+  switch (message.t) {
+    case "welcome":
+      session.overQuota = null;
+      session.seat = validSeat(message.seat) ? message.seat : null;
+      session.relayPeer = Boolean(message.peer);
+      syncPresence(session, 0);
+      if (session.peer) introduce(session);
+      break;
+    case "peer":
+      session.relayPeer = Boolean(message.present);
+      syncPresence(session, 0);
+      if (session.peer) introduce(session);
+      session.note(`host ${session.relayPeer ? "joined" : "left"} the room (relay)`);
+      break;
+    case "info":
+      session.hostInfo = message;
+      followHostMap(session);
+      break;
+    case "state":
+      session.hostState = message;
+      break;
+    case "pause":
+      session.remotePause = Boolean(message.on);
+      break;
+    case "lobby":
+      if (Array.isArray(message.players)) session.lobby = message;
+      break;
+    case "mapp":
+    case "maps":
+      onMapMessage(session, message);
+      break;
+    case "pos":
+      if (Array.isArray(message.o) && message.o.length === 3 && message.o.every(Number.isFinite)) {
+        session.hostPos = { origin: message.o, at: Date.now() };
+        rememberHostTrail(session, session.hostPos);
+      }
+      break;
+    case "error":
+      session.note(`relay error ${message.code}`);
+      if (message.code === "room_full") session.fail("full", MAX_GUESTS + 1);
+      if (message.code === "over_quota") session.overQuota = { resetsAt: message.resetsAt ?? null };
+      break;
+  }
+}
+
+/** The host's record for a seat, created on first use. */
+export function guest(session, seat) {
+  let record = session.guests.get(seat);
+  if (!record) {
+    record = { seat, present: false, state: null, pause: false, slot: null, leftAt: 0, kicks: 0, lastKickAt: 0, sent: {} };
+    session.guests.set(seat, record);
+  }
+  return record;
+}
+
+/**
+ * Who is here, from both paths: a guest (host side) or the host (guest side, seat 0) counts as present while the relay
+ * says so or its direct link is open, so a game with direct links outlives the relay (src/net/direct.js).
+ */
+export function syncPresence(session, seat, { hostLeft = true } = {}) {
+  const direct = session.links.get(seat) === "direct";
+  if (session.mode === "host") {
+    const present = session.relayGuests.has(seat) || direct;
+    const record = session.guests.get(seat);
+    if (present && !record?.present) guestArrived(session, seat);
+    else if (!present && record?.present) guestLeft(session, seat);
+    session.peer = [...session.guests.values()].some((g) => g.present);
+    return;
+  }
+  const was = session.peer;
+  session.peer = session.relayPeer || direct;
+  if (was && !session.peer) {
+    // Losing the relay alone is not the host leaving (the guest waits for it to come back, as before direct links).
+    if (hostLeft) session.hostLeftAt = Date.now();
+    session.remotePause = false;
+    session.note(hostLeft ? "host left" : "relay lost");
+  }
+}
+
+/** The relay socket closed: only direct links still say who is here. */
+export function relayClosed(session) {
+  if (session.mode === "host") {
+    session.relayGuests.clear();
+    for (let seat = 1; seat <= MAX_GUESTS; seat += 1) syncPresence(session, seat);
+  } else if (session.mode === "guest") {
+    session.relayPeer = false;
+    syncPresence(session, 0, { hostLeft: false });
+  }
+}
+
+function guestArrived(session, seat) {
+  if (!validSeat(seat)) return;
+  const record = guest(session, seat);
+  if (!record.present) session.note(`player ${seat + 1} joined the room`);
+  Object.assign(record, { present: true, state: null, pause: false, sent: {}, sentPause: undefined });
+  session.sentLobby = null;
+  sendGameInfo(session, seat);
+}
+
+function guestLeft(session, seat) {
+  const record = guest(session, seat);
+  Object.assign(record, { present: false, leftAt: Date.now(), pause: false });
+  session.note(`player ${seat + 1} left the room`);
+}
+
+/** Guest: tells the host where it is in the join process (and its name). Repeated, so a lost message heals. */
+export function introduce(session) {
+  send(session, { t: "state", phase: session.phase, v: VERSION, name: session.name });
+  send(session, { t: "pause", on: Boolean(session.menuOpen) });
+  session.sentPhase = session.phase;
+  session.sentPhaseAt = Date.now();
+}
+
+/** Host: which map and game settings guests must load. */
+export function sendGameInfo(session, to) {
+  const zone = session.zone ?? currentZone();
+  send(session, {
+    t: "info",
+    v: VERSION,
+    hash: session.hash,
+    zone,
+    slug: MAP_SLUGS[zone] ?? null,
+    horde: currentHorde(),
+    guns: currentGuns(),
+    gameArgs: session.gameSettings,
+    ...(to ? { to } : {}),
+  });
+}
+
+const TRAIL_STEP = 16;
+const TRAIL_MS = 20000;
+
+/** Where the host walked lately: floor a guest can be sent to without landing inside the host (see moveToHost). */
+function rememberHostTrail(session, pos) {
+  const trail = (session.hostTrail ??= []);
+  const last = trail.at(-1);
+  if (!last || Math.hypot(pos.origin[0] - last.origin[0], pos.origin[1] - last.origin[1], pos.origin[2] - last.origin[2]) >= TRAIL_STEP) trail.push(pos);
+  while (trail.length && pos.at - trail[0].at > TRAIL_MS) trail.shift();
+}
